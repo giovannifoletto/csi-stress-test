@@ -60,6 +60,9 @@ type Config struct {
 	Command           string
 	Spread            string
 	NodeSelector      string
+	IgnoreAttachLimit bool
+	HoldUntilEnd      bool
+	Ramp              time.Duration
 	StartupTimeout    time.Duration
 	TeardownTimeout   time.Duration
 	ReportInterval    time.Duration
@@ -130,7 +133,7 @@ func main() {
 	defer stop()
 
 	if cfg.Spread == spreadBalanced {
-		e.balancer, err = newNodeBalancer(setupCtx, client, cfg.nodeSelector, driver)
+		e.balancer, err = newNodeBalancer(setupCtx, client, cfg.nodeSelector, driver, namespaces, cfg.IgnoreAttachLimit)
 		if err != nil {
 			fmt.Printf("Failed to initialise node balancer: %v\n", err)
 			os.Exit(1)
@@ -245,7 +248,10 @@ func parseFlags() (Config, error) {
 	flag.StringVar(&cfg.Workload, "workload", workloadIO, "Pod workload during the hold: 'io' (write/read/verify every volume), 'sleep' (idle, attach/detach only), 'command' (run --command)")
 	flag.StringVar(&cfg.Command, "command", "", "Shell command run by the pod with --workload=command (volumes are mounted at /data/vol0, /data/vol1, ...)")
 	flag.StringVar(&cfg.Spread, "spread", spreadBalanced, "Pod placement: 'balanced' (pin each pod to the least-loaded node), 'soft' (preferred anti-affinity), 'none'")
-	flag.StringVar(&cfg.NodeSelector, "node-selector", "", "Label selector restricting the nodes used by --spread=balanced (e.g. 'node-role.kubernetes.io/worker')")
+	flag.StringVar(&cfg.NodeSelector, "node-selector", "", "Label selector restricting the nodes used by --spread=balanced (e.g. 'node-role.kubernetes.io/worker', or 'kubernetes.io/hostname=NODE' for a single node)")
+	flag.BoolVar(&cfg.IgnoreAttachLimit, "ignore-attach-limit", false, "With --spread=balanced, do not cap volumes per node at the CSINode attach limit (the scheduler still enforces it: extra pods stay Pending)")
+	flag.BoolVar(&cfg.HoldUntilEnd, "hold-until-end", false, "Keep every pod and its volumes until the test stops instead of cycling (ignores --min-hold/--max-hold); use to fill nodes")
+	flag.DurationVar(&cfg.Ramp, "ramp", 0, "Start workers evenly spread over this duration instead of all at once (e.g. 10m)")
 	flag.DurationVar(&cfg.StartupTimeout, "startup-timeout", 3*time.Minute, "Maximum time for PVCs to bind and the pod to reach Running")
 	flag.DurationVar(&cfg.TeardownTimeout, "teardown-timeout", 5*time.Minute, "Maximum time for pod, PVCs and PVs of a cycle to be deleted")
 	flag.DurationVar(&cfg.ReportInterval, "report-interval", 30*time.Second, "Interval between progress reports")
@@ -269,6 +275,9 @@ func parseFlags() (Config, error) {
 	}
 	if cfg.StartupTimeout <= 0 || cfg.TeardownTimeout <= 0 || cfg.ReportInterval <= 0 {
 		return cfg, fmt.Errorf("--startup-timeout, --teardown-timeout and --report-interval must be > 0")
+	}
+	if cfg.Ramp < 0 {
+		return cfg, fmt.Errorf("--ramp must be >= 0")
 	}
 	if cfg.volumeQuantity, err = resource.ParseQuantity(cfg.VolumeCapacity); err != nil {
 		return cfg, fmt.Errorf("--volume-size %q: %w", cfg.VolumeCapacity, err)
@@ -299,6 +308,9 @@ func parseFlags() (Config, error) {
 	case spreadBalanced, spreadSoft, spreadNone:
 	default:
 		return cfg, fmt.Errorf("--spread must be one of balanced, soft, none")
+	}
+	if cfg.Spread != spreadBalanced && (cfg.NodeSelector != "" || cfg.IgnoreAttachLimit) {
+		return cfg, fmt.Errorf("--node-selector and --ignore-attach-limit require --spread=balanced")
 	}
 	if cfg.nodeSelector, err = labels.Parse(cfg.NodeSelector); err != nil {
 		return cfg, fmt.Errorf("--node-selector: %w", err)
@@ -411,6 +423,14 @@ func ensureNamespace(ctx context.Context, client kubernetes.Interface, ns string
 
 func workerLoop(ctx context.Context, e *env, namespaces []string, workerID int) {
 	r := rand.New(rand.NewSource(time.Now().UnixNano() + int64(workerID)))
+
+	if delay := e.cfg.Ramp * time.Duration(workerID) / time.Duration(e.cfg.ConcurrentWorkers); delay > 0 {
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return
+		}
+	}
 
 	for {
 		jitter := time.Duration(r.Intn(3000)) * time.Millisecond

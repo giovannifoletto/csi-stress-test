@@ -101,3 +101,45 @@ func TestPercentiles(t *testing.T) {
 		t.Errorf("empty input should yield 0, got %v", p[0])
 	}
 }
+
+func TestBalancerCapacity(t *testing.T) {
+	b := &nodeBalancer{nodes: map[string]*nodeSlot{
+		"n1": {eligible: true, maxVols: 10, external: 4},
+	}}
+	node, occ := b.tryAcquire(5)
+	if node != "n1" || occ != 4 {
+		t.Fatalf("first acquire: got %q occ=%d", node, occ)
+	}
+	// 4 external + 5 in flight + 2 > 10
+	if node, _ := b.tryAcquire(2); node != "" {
+		t.Errorf("acquire above the attach limit should block, got %q", node)
+	}
+	b.ignoreLimit = true
+	node, occ = b.tryAcquire(2)
+	if node != "n1" || occ != 9 {
+		t.Errorf("acquire with ignoreLimit: got %q occ=%d", node, occ)
+	}
+	b.release("n1", 2)
+	if s := b.nodes["n1"]; s.vols != 5 || s.pods != 1 || s.peak != 11 {
+		t.Errorf("unexpected slot after release %+v", s)
+	}
+}
+
+func TestOccupancy(t *testing.T) {
+	m := newMetrics()
+	start := time.Date(2026, 10, 29, 10, 0, 0, 0, time.UTC)
+	for i := 0; i < 25; i++ {
+		occ := i
+		m.recordCycle(&cycleResult{Node: "n1", PVCs: 1, NodeVols: &occ, Status: statusSuccess,
+			Start: start.Add(time.Duration(i) * 10 * time.Minute), LatenciesMs: map[string][]float64{"attach_mount": {float64(1000 + i*100)}}})
+	}
+	if m.peakNodeVol != 25 || len(m.occupancy) != 25 {
+		t.Fatalf("peak=%d occupancy samples=%d", m.peakNodeVol, len(m.occupancy))
+	}
+	var out strings.Builder
+	m.printOccupancy(&out)
+	// maxOcc 24 -> width 3 -> ranges 0-2 ... 24-26
+	if !strings.Contains(out.String(), "0-2  ") || !strings.Contains(out.String(), "24-26") {
+		t.Errorf("unexpected occupancy table:\n%s", out.String())
+	}
+}

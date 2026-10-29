@@ -39,9 +39,16 @@ type nodeStats struct {
 	attach           []float64
 }
 
+// occSample pairs a cycle's attach_mount latency with the node's volume count when it was assigned.
+type occSample struct {
+	occupancy int
+	attach    float64
+}
+
 type metrics struct {
-	start    time.Time
-	inFlight atomic.Int64
+	start        time.Time
+	inFlight     atomic.Int64
+	inFlightVols atomic.Int64
 
 	mu          sync.Mutex
 	samples     map[string][]float64 // seconds for latencies, MiB/s for throughput
@@ -51,6 +58,8 @@ type metrics struct {
 	noIO        uint64
 	failByPhase map[string]uint64
 	nodes       map[string]*nodeStats
+	occupancy   []occSample
+	peakNodeVol int // highest NodeVols+PVCs of any cycle
 }
 
 func newMetrics() *metrics {
@@ -91,6 +100,13 @@ func (m *metrics) recordCycle(res *cycleResult) {
 		// A buffered read only measures the page cache, so it is not reported.
 		if s.DirectRead && s.ReadMiBps > 0 {
 			m.samples["io_read"] = append(m.samples["io_read"], s.ReadMiBps)
+		}
+	}
+
+	if res.NodeVols != nil && res.Status != statusAborted {
+		m.peakNodeVol = max(m.peakNodeVol, *res.NodeVols+res.PVCs)
+		for _, v := range res.LatenciesMs["attach_mount"] {
+			m.occupancy = append(m.occupancy, occSample{occupancy: *res.NodeVols, attach: v / 1000})
 		}
 	}
 
@@ -143,8 +159,8 @@ func (m *metrics) printProgress(w io.Writer) {
 	defer m.mu.Unlock()
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "[%s] ok=%d failed=%d aborted=%d in-flight=%d",
-		time.Now().Format("15:04:05"), m.success, m.failure, m.aborted, m.inFlight.Load())
+	fmt.Fprintf(&b, "[%s] ok=%d failed=%d aborted=%d in-flight=%d pods/%d vols",
+		time.Now().Format("15:04:05"), m.success, m.failure, m.aborted, m.inFlight.Load(), m.inFlightVols.Load())
 	for _, name := range []string{"pvc_bind", "attach_mount", "pod_delete", "pv_release", "io_write"} {
 		vals := m.samples[name]
 		if len(vals) == 0 {
@@ -199,6 +215,8 @@ func (m *metrics) printSummary(w io.Writer, elapsedLabel string, elapsed time.Du
 	}
 	tw.Flush()
 
+	m.printOccupancy(w)
+
 	if len(m.nodes) == 0 {
 		return
 	}
@@ -219,6 +237,42 @@ func (m *metrics) printSummary(w io.Writer, elapsedLabel string, elapsed time.Du
 			continue
 		}
 		fmt.Fprintf(tw, "%s\t%d\t%d\t%s\t%s\t%s\n", n, ns.success, ns.failure,
+			formatValue(p[0], "s"), formatValue(p[1], "s"), formatValue(p[2], "s"))
+	}
+	tw.Flush()
+}
+
+// printOccupancy shows how attach_mount evolves as nodes fill up, in about ten occupancy ranges.
+// Must be called with m.mu held.
+func (m *metrics) printOccupancy(w io.Writer) {
+	if len(m.occupancy) == 0 {
+		return
+	}
+	maxOcc := 0
+	for _, s := range m.occupancy {
+		maxOcc = max(maxOcc, s.occupancy)
+	}
+	width := (maxOcc + 10) / 10 // ceil((maxOcc+1)/10)
+	buckets := make([][]float64, maxOcc/width+1)
+	for _, s := range m.occupancy {
+		buckets[s.occupancy/width] = append(buckets[s.occupancy/width], s.attach)
+	}
+
+	fmt.Fprintf(w, "\nPeak volumes on a single node (in-flight test volumes + other workloads'): %d\n", m.peakNodeVol)
+	fmt.Fprintln(w, "attach_mount by volumes already on the node:")
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "NODE VOLS\tCOUNT\tP50\tP95\tMAX")
+	for i, vals := range buckets {
+		label := fmt.Sprint(i * width)
+		if width > 1 {
+			label = fmt.Sprintf("%d-%d", i*width, (i+1)*width-1)
+		}
+		if len(vals) == 0 {
+			fmt.Fprintf(tw, "%s\t0\t-\t-\t-\n", label)
+			continue
+		}
+		p := percentiles(vals, 0.5, 0.95, 1)
+		fmt.Fprintf(tw, "%s\t%d\t%s\t%s\t%s\n", label, len(vals),
 			formatValue(p[0], "s"), formatValue(p[1], "s"), formatValue(p[2], "s"))
 	}
 	tw.Flush()

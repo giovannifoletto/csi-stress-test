@@ -18,12 +18,14 @@ import (
 
 // nodeBalancer hands every cycle the eligible node with the fewest in-flight test pods (ties broken
 // by fewest total assignments), so pods and therefore volume attachments spread evenly over all hosts.
-// It also keeps in-flight test volumes under each node's CSINode attach limit. Volumes attached by
-// other workloads are not counted, so the limit is an upper bound rather than exact headroom.
+// It also keeps in-flight test volumes plus the volumes other workloads have attached through the
+// same driver (VolumeAttachments, refreshed every interval) under each node's CSINode attach limit.
 type nodeBalancer struct {
-	client   kubernetes.Interface
-	selector labels.Selector
-	driver   string
+	client      kubernetes.Interface
+	selector    labels.Selector
+	driver      string
+	testNS      map[string]bool // PVs claimed from these namespaces belong to the test
+	ignoreLimit bool
 
 	mu       sync.Mutex
 	nodes    map[string]*nodeSlot
@@ -34,13 +36,20 @@ type nodeSlot struct {
 	eligible bool
 	reason   string // why the node is not eligible
 	maxVols  int    // CSINode allocatable count; 0 = unknown/unlimited
+	external int    // volumes of the driver attached to the node by other workloads
 	pods     int
-	vols     int
+	vols     int // in-flight test volumes, reserved from acquire until detached
+	peak     int // highest vols+external seen when a pod was assigned
 	assigned uint64
 }
 
-func newNodeBalancer(ctx context.Context, client kubernetes.Interface, selector labels.Selector, driver string) (*nodeBalancer, error) {
-	b := &nodeBalancer{client: client, selector: selector, driver: driver, nodes: map[string]*nodeSlot{}}
+func newNodeBalancer(ctx context.Context, client kubernetes.Interface, selector labels.Selector, driver string,
+	namespaces []string, ignoreLimit bool) (*nodeBalancer, error) {
+	b := &nodeBalancer{client: client, selector: selector, driver: driver, testNS: map[string]bool{},
+		ignoreLimit: ignoreLimit, nodes: map[string]*nodeSlot{}}
+	for _, ns := range namespaces {
+		b.testNS[ns] = true
+	}
 	if err := b.refresh(ctx, false); err != nil {
 		return nil, err
 	}
@@ -94,9 +103,19 @@ func (b *nodeBalancer) refresh(ctx context.Context, logChanges bool) error {
 			csiKnown = len(registered) > 0
 		}
 	}
+	external, extErr := b.externalAttachments(ctx)
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
+	if extErr != nil {
+		// Not fatal (e.g. no RBAC on VolumeAttachments): keep the last known counts.
+		fmt.Printf("[%s] WARN cannot count other workloads' attachments: %v\n", time.Now().Format("15:04:05"), extErr)
+		external = map[string]int{}
+		for name, slot := range b.nodes {
+			external[name] = slot.external
+		}
+	}
 
 	seen := map[string]bool{}
 	for i := range nodes.Items {
@@ -106,18 +125,50 @@ func (b *nodeBalancer) refresh(ctx context.Context, logChanges bool) error {
 		if reason == "" && csiKnown && !registered[n.Name] {
 			reason = "CSI driver " + b.driver + " not registered"
 		}
-		b.update(n.Name, reason, limits[n.Name], logChanges)
+		b.update(n.Name, reason, limits[n.Name], external[n.Name], logChanges)
 	}
 	for name, slot := range b.nodes {
 		if !seen[name] && slot.eligible {
-			b.update(name, "node removed or no longer matches selector", slot.maxVols, logChanges)
+			b.update(name, "node removed or no longer matches selector", slot.maxVols, slot.external, logChanges)
 		}
 	}
 	return nil
 }
 
+// externalAttachments counts, per node, the driver's VolumeAttachments that do not belong to test PVs.
+func (b *nodeBalancer) externalAttachments(ctx context.Context) (map[string]int, error) {
+	out := map[string]int{}
+	if b.driver == "" {
+		return out, nil
+	}
+	vas, err := b.client.StorageV1().VolumeAttachments().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("list VolumeAttachments: %w", err)
+	}
+	pvs, err := b.client.CoreV1().PersistentVolumes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("list PersistentVolumes: %w", err)
+	}
+	testPV := map[string]bool{}
+	for i := range pvs.Items {
+		if ref := pvs.Items[i].Spec.ClaimRef; ref != nil && b.testNS[ref.Namespace] {
+			testPV[pvs.Items[i].Name] = true
+		}
+	}
+	for _, va := range vas.Items {
+		if va.Spec.Attacher != b.driver {
+			continue
+		}
+		if pv := va.Spec.Source.PersistentVolumeName; pv != nil && testPV[*pv] {
+			continue
+		}
+		out[va.Spec.NodeName]++
+	}
+	return out, nil
+}
+
 // update must be called with b.mu held.
-func (b *nodeBalancer) update(name, reason string, maxVols int, logChanges bool) {
+func (b *nodeBalancer) update(name, reason string, maxVols, external int, logChanges bool) {
 	slot, ok := b.nodes[name]
 	if !ok {
 		slot = &nodeSlot{}
@@ -134,6 +185,7 @@ func (b *nodeBalancer) update(name, reason string, maxVols int, logChanges bool)
 	slot.eligible = eligible
 	slot.reason = reason
 	slot.maxVols = maxVols
+	slot.external = external
 }
 
 // nodeIneligibility returns why the test pod cannot run on n, or "" if it can.
@@ -171,28 +223,29 @@ func (b *nodeBalancer) eligibleCount() int {
 	return n
 }
 
-// acquire blocks until a node can take a pod with vols volumes, then reserves it.
-func (b *nodeBalancer) acquire(ctx context.Context, vols int) (string, error) {
+// acquire blocks until a node can take a pod with vols volumes, then reserves it. It also returns
+// the node's occupancy before the reservation: in-flight test volumes plus other workloads' ones.
+func (b *nodeBalancer) acquire(ctx context.Context, vols int) (string, int, error) {
 	for {
-		if node := b.tryAcquire(vols); node != "" {
-			return node, nil
+		if node, occupancy := b.tryAcquire(vols); node != "" {
+			return node, occupancy, nil
 		}
 		select {
 		case <-ctx.Done():
-			return "", ctx.Err()
+			return "", 0, ctx.Err()
 		case <-time.After(time.Second):
 		}
 	}
 }
 
-func (b *nodeBalancer) tryAcquire(vols int) string {
+func (b *nodeBalancer) tryAcquire(vols int) (string, int) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	best := ""
 	var bestSlot *nodeSlot
 	for name, s := range b.nodes {
-		if !s.eligible || (s.maxVols > 0 && s.vols+vols > s.maxVols) {
+		if !s.eligible || (!b.ignoreLimit && s.maxVols > 0 && s.external+s.vols+vols > s.maxVols) {
 			continue
 		}
 		if bestSlot == nil ||
@@ -208,12 +261,14 @@ func (b *nodeBalancer) tryAcquire(vols int) string {
 			fmt.Printf("[%s] WARN no node has capacity for %d more volumes; workers are waiting\n",
 				time.Now().Format("15:04:05"), vols)
 		}
-		return ""
+		return "", 0
 	}
+	occupancy := bestSlot.vols + bestSlot.external
 	bestSlot.pods++
 	bestSlot.vols += vols
 	bestSlot.assigned++
-	return best
+	bestSlot.peak = max(bestSlot.peak, occupancy+vols)
+	return best, occupancy
 }
 
 func (b *nodeBalancer) release(node string, vols int) {
@@ -237,7 +292,7 @@ func (b *nodeBalancer) printNodes() {
 
 	fmt.Println("Node balancer:")
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "NODE\tSTATUS\tATTACH LIMIT\tASSIGNED\tIN-FLIGHT PODS\tIN-FLIGHT VOLS")
+	fmt.Fprintln(tw, "NODE\tSTATUS\tATTACH LIMIT\tOTHER VOLS\tASSIGNED\tIN-FLIGHT PODS\tIN-FLIGHT VOLS\tPEAK VOLS")
 	for _, n := range names {
 		s := b.nodes[n]
 		status := "eligible"
@@ -248,7 +303,7 @@ func (b *nodeBalancer) printNodes() {
 		if s.maxVols > 0 {
 			limit = fmt.Sprint(s.maxVols)
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%d\t%d\n", n, status, limit, s.assigned, s.pods, s.vols)
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%d\t%d\t%d\t%d\n", n, status, limit, s.external, s.assigned, s.pods, s.vols, s.peak)
 	}
 	tw.Flush()
 }

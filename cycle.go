@@ -31,10 +31,13 @@ type ioSample struct {
 
 // cycleResult is the outcome of one PVC+pod lifecycle; it is also the JSONL record.
 type cycleResult struct {
-	ID          string               `json:"id"`
-	Namespace   string               `json:"namespace"`
-	Node        string               `json:"node,omitempty"`
-	PVCs        int                  `json:"pvcs"`
+	ID        string `json:"id"`
+	Namespace string `json:"namespace"`
+	Node      string `json:"node,omitempty"`
+	PVCs      int    `json:"pvcs"`
+	// NodeVols is the node's volume count when this cycle was assigned to it, before its own
+	// volumes (in-flight test volumes plus other workloads' attachments). Only with --spread=balanced.
+	NodeVols    *int                 `json:"node_vols,omitempty"`
 	Start       time.Time            `json:"start"`
 	Status      string               `json:"status"`
 	FailedPhase string               `json:"failed_phase,omitempty"`
@@ -90,17 +93,20 @@ func runCycle(ctx context.Context, e *env, namespace string, r *rand.Rand, worke
 	}
 
 	if e.balancer != nil {
-		node, err := e.balancer.acquire(ctx, pvcCount)
+		node, occupancy, err := e.balancer.acquire(ctx, pvcCount)
 		if err != nil {
 			return nil
 		}
 		c.res.Node = node
+		c.res.NodeVols = &occupancy
 		// Released only after teardown, i.e. once the volumes are detached from the node.
 		defer e.balancer.release(node, pvcCount)
 	}
 
 	e.metrics.inFlight.Add(1)
+	e.metrics.inFlightVols.Add(int64(pvcCount))
 	defer e.metrics.inFlight.Add(-1)
+	defer e.metrics.inFlightVols.Add(-int64(pvcCount))
 
 	c.res.Start = time.Now()
 	runErr := c.run(ctx, hold)
@@ -194,9 +200,14 @@ func (c *cycle) run(ctx context.Context, hold time.Duration) error {
 	case <-startupCtx.Done():
 	}
 
-	// 4. Hold while the pod performs I/O, failing fast if it stops running (I/O or checksum error)
-	holdCtx, cancelHold := context.WithTimeout(ctx, hold)
-	defer cancelHold()
+	// 4. Hold while the pod performs I/O, failing fast if it stops running (I/O or checksum error).
+	// With --hold-until-end the hold lasts until the test stops, and reaching it is a success.
+	holdCtx := ctx
+	if !cfg.HoldUntilEnd {
+		var cancelHold context.CancelFunc
+		holdCtx, cancelHold = context.WithTimeout(ctx, hold)
+		defer cancelHold()
+	}
 	pod, err := waitPodLeavesRunning(holdCtx, client, c.ns, c.podName)
 	switch {
 	case err == nil:
@@ -205,7 +216,7 @@ func (c *cycle) run(ctx context.Context, hold time.Duration) error {
 			phase = pod.Status.Phase
 		}
 		return phaseErr("io", fmt.Errorf("pod left Running during hold (phase %s): %s", phase, c.logTail()))
-	case ctx.Err() != nil:
+	case ctx.Err() != nil && !cfg.HoldUntilEnd:
 		return ctx.Err()
 	case holdCtx.Err() == nil:
 		return phaseErr("io", fmt.Errorf("watching pod during hold: %w", err))
