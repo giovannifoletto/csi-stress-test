@@ -40,6 +40,16 @@ All timestamps come from watch events, not polling.
 Progress is printed every `--report-interval`. At the end the tool prints p50/p95/p99 per metric,
 failures by phase and per-node results. `--results-file` writes one JSON record per cycle.
 
+The `report` subcommand rebuilds that summary from one or more results files, aggregating all
+their cycles into a single report (no cluster access needed):
+
+```sh
+./csi-stress-test-x86 report results.jsonl
+./csi-stress-test-x86 report runs/*.jsonl
+```
+
+Elapsed is then the span between the first and the last cycle start across all files.
+
 A cycle fails if a step times out (`--startup-timeout`, `--teardown-timeout`), the pod stops running
 during the hold (I/O error or checksum mismatch), or a volume is not released. The failure line
 includes the pod conditions and the latest warning events (FailedAttachVolume, FailedMount, ...).

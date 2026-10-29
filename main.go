@@ -73,6 +73,10 @@ type env struct {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "report" {
+		os.Exit(runReport(os.Args[2:]))
+	}
+
 	cfg, err := parseFlags()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Invalid configuration: %v\n", err)
@@ -168,10 +172,46 @@ func main() {
 	}
 
 	fmt.Println("\n--- Test Complete ---")
-	e.metrics.printSummary(os.Stdout)
+	e.metrics.printSummary(os.Stdout, "Elapsed", time.Since(e.metrics.start))
 	if e.balancer != nil {
 		e.balancer.printNodes()
 	}
+}
+
+// runReport rebuilds the end-of-run summary from one or more --results-file outputs.
+func runReport(args []string) int {
+	fs := flag.NewFlagSet("report", flag.ContinueOnError)
+	fs.Usage = func() {
+		fmt.Fprintf(fs.Output(), "Usage: %s report RESULTS.jsonl [RESULTS.jsonl ...]\n\n"+
+			"Aggregates the per-cycle records written by --results-file into a single summary.\n",
+			filepath.Base(os.Args[0]))
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() == 0 {
+		fs.Usage()
+		return 2
+	}
+
+	m := newMetrics()
+	first, last, n, err := loadResults(m, fs.Args())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to read results: %v\n", err)
+		return 1
+	}
+	if n == 0 {
+		fmt.Fprintln(os.Stderr, "No valid records found.")
+		return 1
+	}
+
+	fmt.Printf("--- Report: %d cycles from %d file(s) ---\n", n, fs.NArg())
+	m.printSummary(os.Stdout, "Elapsed (first -> last cycle start)", last.Sub(first))
+	return 0
 }
 
 func parseFlags() (Config, error) {

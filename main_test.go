@@ -2,8 +2,54 @@ package main
 
 import (
 	"math"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 )
+
+func TestLoadResults(t *testing.T) {
+	dir := t.TempDir()
+	a := filepath.Join(dir, "a.jsonl")
+	b := filepath.Join(dir, "b.jsonl")
+	writeFile := func(path, content string) {
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeFile(a, `{"id":"c1","namespace":"ns-1","node":"node-a","pvcs":2,"start":"2026-10-29T10:00:00Z","status":"success",`+
+		`"latencies_ms":{"pvc_bind":[1000,2000],"attach_mount":[3000]},`+
+		`"io":[{"volume":"vol0","iterations":1,"write_mibps":50,"read_mibps":80,"direct_read":true},`+
+		`{"volume":"vol1","iterations":1,"write_mibps":40,"read_mibps":900,"direct_read":false}]}`+"\n\n")
+	writeFile(b, `{"id":"c2","namespace":"ns-2","node":"node-b","pvcs":1,"start":"2026-10-29T10:05:00Z","status":"failure",`+
+		`"failed_phase":"attach_mount","error":"timeout","latencies_ms":{"pvc_bind":[500]}}`+"\n"+
+		`{"id":"truncated","namespace":`)
+
+	m := newMetrics()
+	first, last, n, err := loadResults(m, []string{a, b})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 || m.success != 1 || m.failure != 1 || m.failByPhase["attach_mount"] != 1 {
+		t.Errorf("unexpected counters n=%d success=%d failure=%d byPhase=%v", n, m.success, m.failure, m.failByPhase)
+	}
+	if got := len(m.samples["pvc_bind"]); got != 3 {
+		t.Errorf("pvc_bind samples: got %d want 3", got)
+	}
+	if len(m.samples["io_write"]) != 2 || len(m.samples["io_read"]) != 1 {
+		t.Errorf("io samples: write=%v read=%v", m.samples["io_write"], m.samples["io_read"])
+	}
+	if len(m.nodes) != 2 || m.nodes["node-a"].success != 1 || m.nodes["node-b"].failure != 1 {
+		t.Errorf("unexpected node stats %+v", m.nodes)
+	}
+	if got := last.Sub(first); got != 5*time.Minute {
+		t.Errorf("span: got %v want 5m", got)
+	}
+
+	if _, _, _, err := loadResults(newMetrics(), []string{filepath.Join(dir, "missing.jsonl")}); err == nil {
+		t.Error("expected error for missing file")
+	}
+}
 
 func TestParseIOSamples(t *testing.T) {
 	logs := "noise\n" +

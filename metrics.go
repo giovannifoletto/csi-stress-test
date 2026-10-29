@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -158,13 +160,13 @@ func (m *metrics) printProgress(w io.Writer) {
 	fmt.Fprintln(w, b.String())
 }
 
-func (m *metrics) printSummary(w io.Writer) {
+// printSummary prints the final report; elapsedLabel names what elapsed measures.
+func (m *metrics) printSummary(w io.Writer, elapsedLabel string, elapsed time.Duration) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	elapsed := time.Since(m.start).Round(time.Second)
-	fmt.Fprintf(w, "Elapsed: %v\nSuccessful Lifecycles: %d\nFailed Lifecycles: %d\nAborted at shutdown: %d\n",
-		elapsed, m.success, m.failure, m.aborted)
+	fmt.Fprintf(w, "%s: %v\nSuccessful Lifecycles: %d\nFailed Lifecycles: %d\nAborted at shutdown: %d\n",
+		elapsedLabel, elapsed.Round(time.Second), m.success, m.failure, m.aborted)
 	if m.noIO > 0 {
 		fmt.Fprintf(w, "Successful cycles without a completed I/O iteration (hold too short or I/O stalled): %d\n", m.noIO)
 	}
@@ -247,4 +249,44 @@ func (r *resultsWriter) Write(res *cycleResult) {
 
 func (r *resultsWriter) Close() error {
 	return r.f.Close()
+}
+
+// loadResults feeds every record of the given JSONL results files into m.
+// Malformed lines (e.g. a truncated last line after a hard kill) are skipped with a warning.
+// It returns the earliest and latest cycle start and the number of records loaded.
+func loadResults(m *metrics, paths []string) (first, last time.Time, n int, err error) {
+	for _, path := range paths {
+		f, err := os.Open(path)
+		if err != nil {
+			return first, last, n, err
+		}
+		sc := bufio.NewScanner(f)
+		// Records carry per-volume I/O samples and can exceed the 64KiB default.
+		sc.Buffer(make([]byte, 0, 64<<10), 4<<20)
+		for line := 1; sc.Scan(); line++ {
+			raw := bytes.TrimSpace(sc.Bytes())
+			if len(raw) == 0 {
+				continue
+			}
+			var res cycleResult
+			if err := json.Unmarshal(raw, &res); err != nil {
+				fmt.Fprintf(os.Stderr, "WARN: %s:%d: %v\n", path, line, err)
+				continue
+			}
+			m.recordCycle(&res)
+			n++
+			if first.IsZero() || res.Start.Before(first) {
+				first = res.Start
+			}
+			if res.Start.After(last) {
+				last = res.Start
+			}
+		}
+		err = sc.Err()
+		f.Close()
+		if err != nil {
+			return first, last, n, fmt.Errorf("%s: %w", path, err)
+		}
+	}
+	return first, last, n, nil
 }
