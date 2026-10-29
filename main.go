@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -34,6 +35,10 @@ const (
 	spreadBalanced = "balanced"
 	spreadSoft     = "soft"
 	spreadNone     = "none"
+
+	workloadIO      = "io"
+	workloadSleep   = "sleep"
+	workloadCommand = "command"
 )
 
 type Config struct {
@@ -51,6 +56,8 @@ type Config struct {
 	CleanUpOnExit     bool
 	Image             string
 	IOSizeMiB         int
+	Workload          string
+	Command           string
 	Spread            string
 	NodeSelector      string
 	StartupTimeout    time.Duration
@@ -235,6 +242,8 @@ func parseFlags() (Config, error) {
 	flag.BoolVar(&cfg.CleanUpOnExit, "cleanup", true, "Delete lingering stress pods, PVCs, and namespaces upon completion")
 	flag.StringVar(&cfg.Image, "image", "registry.access.redhat.com/ubi9/ubi-minimal:latest", "Container image for the I/O pod (needs sh, dd, md5sum, date)")
 	flag.IntVar(&cfg.IOSizeMiB, "io-size", 10, "Size in MiB of each file written/read per I/O iteration")
+	flag.StringVar(&cfg.Workload, "workload", workloadIO, "Pod workload during the hold: 'io' (write/read/verify every volume), 'sleep' (idle, attach/detach only), 'command' (run --command)")
+	flag.StringVar(&cfg.Command, "command", "", "Shell command run by the pod with --workload=command (volumes are mounted at /data/vol0, /data/vol1, ...)")
 	flag.StringVar(&cfg.Spread, "spread", spreadBalanced, "Pod placement: 'balanced' (pin each pod to the least-loaded node), 'soft' (preferred anti-affinity), 'none'")
 	flag.StringVar(&cfg.NodeSelector, "node-selector", "", "Label selector restricting the nodes used by --spread=balanced (e.g. 'node-role.kubernetes.io/worker')")
 	flag.DurationVar(&cfg.StartupTimeout, "startup-timeout", 3*time.Minute, "Maximum time for PVCs to bind and the pod to reach Running")
@@ -273,6 +282,18 @@ func parseFlags() (Config, error) {
 	// The test file plus a 1MiB direct-I/O probe must fit, leaving headroom for filesystem metadata.
 	if int64(cfg.IOSizeMiB+1)<<20 > cfg.volumeQuantity.Value()*9/10 {
 		return cfg, fmt.Errorf("--io-size %dMiB does not fit comfortably in --volume-size %s", cfg.IOSizeMiB, cfg.VolumeCapacity)
+	}
+	switch cfg.Workload {
+	case workloadIO, workloadSleep:
+		if cfg.Command != "" {
+			return cfg, fmt.Errorf("--command requires --workload=command")
+		}
+	case workloadCommand:
+		if strings.TrimSpace(cfg.Command) == "" {
+			return cfg, fmt.Errorf("--workload=command requires --command")
+		}
+	default:
+		return cfg, fmt.Errorf("--workload must be one of io, sleep, command")
 	}
 	switch cfg.Spread {
 	case spreadBalanced, spreadSoft, spreadNone:

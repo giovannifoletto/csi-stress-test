@@ -4,9 +4,25 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestPodScript(t *testing.T) {
+	cfg := Config{Workload: workloadIO, IOSizeMiB: 7}
+	if s := podScript(cfg); !strings.Contains(s, "MIB=7") || strings.Contains(s, "__IO_MIB__") {
+		t.Errorf("io script not templated: %q", s)
+	}
+	cfg.Workload = workloadSleep
+	if s := podScript(cfg); s != "exec sleep infinity\n" {
+		t.Errorf("unexpected sleep script %q", s)
+	}
+	cfg.Workload, cfg.Command = workloadCommand, "touch /data/vol0/x"
+	if s := podScript(cfg); s != "set -e\ntouch /data/vol0/x\nexec sleep infinity\n" {
+		t.Errorf("unexpected command script %q", s)
+	}
+}
 
 func TestLoadResults(t *testing.T) {
 	dir := t.TempDir()

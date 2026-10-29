@@ -56,6 +56,20 @@ while true; do
 done
 `
 
+// podScript returns the shell script the pod runs for the configured --workload. The pod must
+// keep running for the whole hold (leaving Running fails the cycle), so a --command that
+// completes successfully is followed by an idle sleep, while a non-zero exit fails the pod.
+func podScript(cfg Config) string {
+	switch cfg.Workload {
+	case workloadSleep:
+		return "exec sleep infinity\n"
+	case workloadCommand:
+		return "set -e\n" + cfg.Command + "\nexec sleep infinity\n"
+	default:
+		return strings.ReplaceAll(ioScript, "__IO_MIB__", strconv.Itoa(cfg.IOSizeMiB))
+	}
+}
+
 func buildPVCSpec(cfg Config, name, cycleID string) *corev1.PersistentVolumeClaim {
 	var scName *string
 	if cfg.StorageClass != "" {
@@ -143,8 +157,6 @@ func buildPodSpec(cfg Config, namespace, podName, cycleID string, pvcNames []str
 		}
 	}
 
-	script := strings.ReplaceAll(ioScript, "__IO_MIB__", strconv.Itoa(cfg.IOSizeMiB))
-
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      podName,
@@ -172,7 +184,7 @@ func buildPodSpec(cfg Config, namespace, podName, cycleID string, pvcNames []str
 				{
 					Name:    "io-runner",
 					Image:   cfg.Image,
-					Command: []string{"/bin/sh", "-c", script},
+					Command: []string{"/bin/sh", "-c", podScript(cfg)},
 					// Avoid a registry round-trip per pod skewing attach_mount latency.
 					ImagePullPolicy: corev1.PullIfNotPresent,
 					VolumeMounts:    mounts,
