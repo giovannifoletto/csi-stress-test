@@ -60,6 +60,14 @@ type metrics struct {
 	nodes       map[string]*nodeStats
 	occupancy   []occSample
 	peakNodeVol int // highest NodeVols+PVCs of any cycle
+
+	// Samples since the last progress line, so the progress shows the current behaviour instead
+	// of an average since the start that hides slow degradation. Only kept when windowed is set.
+	windowed   bool
+	window     map[string][]float64
+	winSuccess uint64
+	winFailure uint64
+	winStart   time.Time
 }
 
 func newMetrics() *metrics {
@@ -68,6 +76,8 @@ func newMetrics() *metrics {
 		samples:     map[string][]float64{},
 		failByPhase: map[string]uint64{},
 		nodes:       map[string]*nodeStats{},
+		window:      map[string][]float64{},
+		winStart:    time.Now(),
 	}
 }
 
@@ -78,28 +88,36 @@ func (m *metrics) recordCycle(res *cycleResult) {
 	switch res.Status {
 	case statusSuccess:
 		m.success++
+		m.winSuccess++
 		if len(res.IO) == 0 {
 			m.noIO++
 		}
 	case statusFailure:
 		m.failure++
+		m.winFailure++
 		m.failByPhase[res.FailedPhase]++
 	case statusAborted:
 		m.aborted++
 	}
 
+	add := func(name string, v float64) {
+		m.samples[name] = append(m.samples[name], v)
+		if m.windowed {
+			m.window[name] = append(m.window[name], v)
+		}
+	}
 	for name, vals := range res.LatenciesMs {
 		for _, v := range vals {
-			m.samples[name] = append(m.samples[name], v/1000)
+			add(name, v/1000)
 		}
 	}
 	for _, s := range res.IO {
 		if s.WriteMiBps > 0 {
-			m.samples["io_write"] = append(m.samples["io_write"], s.WriteMiBps)
+			add("io_write", s.WriteMiBps)
 		}
 		// A buffered read only measures the page cache, so it is not reported.
 		if s.DirectRead && s.ReadMiBps > 0 {
-			m.samples["io_read"] = append(m.samples["io_read"], s.ReadMiBps)
+			add("io_read", s.ReadMiBps)
 		}
 	}
 
@@ -154,26 +172,39 @@ func formatValue(v float64, unit string) string {
 	return fmt.Sprintf("%.1f", v)
 }
 
+var progressMetrics = []string{"pvc_bind", "attach_mount", "pod_delete", "pv_release", "io_write"}
+
+func metricUnit(name string) string {
+	if strings.HasPrefix(name, "io_") {
+		return "MiB/s"
+	}
+	return "s"
+}
+
+// printProgress prints the totals so far and the percentiles of the cycles completed since the
+// previous call, then starts a new window.
 func (m *metrics) printProgress(w io.Writer) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	now := time.Now()
 	var b strings.Builder
-	fmt.Fprintf(&b, "[%s] ok=%d failed=%d aborted=%d in-flight=%d pods/%d vols",
-		time.Now().Format("15:04:05"), m.success, m.failure, m.aborted, m.inFlight.Load(), m.inFlightVols.Load())
-	for _, name := range []string{"pvc_bind", "attach_mount", "pod_delete", "pv_release", "io_write"} {
-		vals := m.samples[name]
+	fmt.Fprintf(&b, "[%s] ok=%d failed=%d aborted=%d in-flight=%d pods/%d vols | last %v: ok=%d failed=%d",
+		now.Format("15:04:05"), m.success, m.failure, m.aborted, m.inFlight.Load(), m.inFlightVols.Load(),
+		now.Sub(m.winStart).Round(time.Second), m.winSuccess, m.winFailure)
+	for _, name := range progressMetrics {
+		vals := m.window[name]
 		if len(vals) == 0 {
 			continue
 		}
-		unit := "s"
-		if strings.HasPrefix(name, "io_") {
-			unit = "MiB/s"
-		}
-		p := percentiles(append([]float64(nil), vals...), 0.5, 0.95)
-		fmt.Fprintf(&b, " | %s p50=%s p95=%s", name, formatValue(p[0], unit), formatValue(p[1], unit))
+		p := percentiles(vals, 0.5, 0.95)
+		fmt.Fprintf(&b, " | %s p50=%s p95=%s", name, formatValue(p[0], metricUnit(name)), formatValue(p[1], metricUnit(name)))
 	}
 	fmt.Fprintln(w, b.String())
+
+	m.window = map[string][]float64{}
+	m.winSuccess, m.winFailure = 0, 0
+	m.winStart = now
 }
 
 // printSummary prints the final report; elapsedLabel names what elapsed measures.
@@ -278,6 +309,58 @@ func (m *metrics) printOccupancy(w io.Writer) {
 	tw.Flush()
 }
 
+// printBuckets prints one row per time window (including empty ones, so gaps stand out), to spot
+// latency drift, throughput decay or failure bursts over a long run.
+func printBuckets(w io.Writer, buckets map[time.Time]*metrics, size time.Duration) {
+	if len(buckets) == 0 {
+		return
+	}
+	var first, last time.Time
+	for t := range buckets {
+		if first.IsZero() || t.Before(first) {
+			first = t
+		}
+		if t.After(last) {
+			last = t
+		}
+	}
+
+	label := size.String()
+	if strings.HasSuffix(label, "m0s") {
+		label = strings.TrimSuffix(label, "0s")
+	}
+	if strings.HasSuffix(label, "h0m") {
+		label = strings.TrimSuffix(label, "0m")
+	}
+	fmt.Fprintf(w, "\nPer-%s windows (p50/p95):\n", label)
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	header := "WINDOW START\tOK\tFAILED"
+	for _, name := range progressMetrics {
+		header += "\t" + strings.ToUpper(name)
+	}
+	fmt.Fprintln(tw, header)
+	for t := first; !t.After(last); t = t.Add(size) {
+		row := t.Format(time.RFC3339)
+		m := buckets[t]
+		if m == nil {
+			fmt.Fprintf(tw, "%s\t0\t0%s\n", row, strings.Repeat("\t-", len(progressMetrics)))
+			continue
+		}
+		row += fmt.Sprintf("\t%d\t%d", m.success, m.failure)
+		for _, name := range progressMetrics {
+			vals := m.samples[name]
+			if len(vals) == 0 {
+				row += "\t-"
+				continue
+			}
+			p := percentiles(vals, 0.5, 0.95)
+			row += "\t" + formatValue(p[0], metricUnit(name)) + "/" + formatValue(p[1], metricUnit(name))
+		}
+		fmt.Fprintln(tw, row)
+	}
+	tw.Flush()
+}
+
 // resultsWriter appends one JSON object per cycle.
 type resultsWriter struct {
 	mu  sync.Mutex
@@ -305,10 +388,10 @@ func (r *resultsWriter) Close() error {
 	return r.f.Close()
 }
 
-// loadResults feeds every record of the given JSONL results files into m.
+// loadResults passes every record of the given JSONL results files to visit.
 // Malformed lines (e.g. a truncated last line after a hard kill) are skipped with a warning.
 // It returns the earliest and latest cycle start and the number of records loaded.
-func loadResults(m *metrics, paths []string) (first, last time.Time, n int, err error) {
+func loadResults(paths []string, visit func(*cycleResult)) (first, last time.Time, n int, err error) {
 	for _, path := range paths {
 		f, err := os.Open(path)
 		if err != nil {
@@ -327,7 +410,7 @@ func loadResults(m *metrics, paths []string) (first, last time.Time, n int, err 
 				fmt.Fprintf(os.Stderr, "WARN: %s:%d: %v\n", path, line, err)
 				continue
 			}
-			m.recordCycle(&res)
+			visit(&res)
 			n++
 			if first.IsZero() || res.Start.Before(first) {
 				first = res.Start

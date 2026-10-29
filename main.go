@@ -63,6 +63,7 @@ type Config struct {
 	IgnoreAttachLimit bool
 	HoldUntilEnd      bool
 	Ramp              time.Duration
+	AuditInterval     time.Duration
 	StartupTimeout    time.Duration
 	TeardownTimeout   time.Duration
 	ReportInterval    time.Duration
@@ -108,6 +109,10 @@ func main() {
 		os.Exit(1)
 	}
 	driver := describeStorageClass(sc, cfg)
+	scName := ""
+	if sc != nil {
+		scName = sc.Name
+	}
 
 	namespaces := generateNamespaceNames(cfg.NamespacePrefix, cfg.NamespaceCount)
 	fmt.Printf("Ensuring %d namespaces (prefix: '%s') exist...\n", len(namespaces), cfg.NamespacePrefix)
@@ -119,6 +124,7 @@ func main() {
 	}
 
 	e := &env{client: client, cfg: cfg, metrics: newMetrics()}
+	e.metrics.windowed = true
 
 	if cfg.ResultsFile != "" {
 		e.results, err = newResultsWriter(cfg.ResultsFile)
@@ -155,6 +161,13 @@ func main() {
 
 	go runReporter(ctx, e, cfg.ReportInterval)
 
+	var audit *auditor
+	if cfg.AuditInterval > 0 {
+		audit = newAuditor(client, driver, scName, namespaces, cfg.TeardownTimeout)
+		audit.start(setupCtx)
+		go audit.run(ctx, cfg.AuditInterval)
+	}
+
 	var wg sync.WaitGroup
 	for i := 0; i < cfg.ConcurrentWorkers; i++ {
 		wg.Add(1)
@@ -180,6 +193,15 @@ func main() {
 		defer cleanupCancel()
 		cleanupAllStressResources(cleanupCtx, client, namespaces)
 	}
+	if audit != nil {
+		auditCtx, auditCancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		defer auditCancel()
+		wait := time.Duration(0)
+		if cfg.CleanUpOnExit {
+			wait = 2 * time.Minute
+		}
+		audit.final(auditCtx, wait)
+	}
 
 	fmt.Println("\n--- Test Complete ---")
 	e.metrics.printSummary(os.Stdout, "Elapsed", time.Since(e.metrics.start))
@@ -191,8 +213,9 @@ func main() {
 // runReport rebuilds the end-of-run summary from one or more --results-file outputs.
 func runReport(args []string) int {
 	fs := flag.NewFlagSet("report", flag.ContinueOnError)
+	bucket := fs.Duration("bucket", 0, "Also print p50/p95 and failures per time window of this size (e.g. 1h), to spot drift over a soak run")
 	fs.Usage = func() {
-		fmt.Fprintf(fs.Output(), "Usage: %s report RESULTS.jsonl [RESULTS.jsonl ...]\n\n"+
+		fmt.Fprintf(fs.Output(), "Usage: %s report [--bucket 1h] RESULTS.jsonl [RESULTS.jsonl ...]\n\n"+
 			"Aggregates the per-cycle records written by --results-file into a single summary.\n",
 			filepath.Base(os.Args[0]))
 		fs.PrintDefaults()
@@ -208,8 +231,23 @@ func runReport(args []string) int {
 		return 2
 	}
 
+	if *bucket < 0 {
+		fmt.Fprintln(os.Stderr, "--bucket must be >= 0")
+		return 2
+	}
+
 	m := newMetrics()
-	first, last, n, err := loadResults(m, fs.Args())
+	buckets := map[time.Time]*metrics{}
+	first, last, n, err := loadResults(fs.Args(), func(res *cycleResult) {
+		m.recordCycle(res)
+		if *bucket > 0 {
+			key := res.Start.Truncate(*bucket)
+			if buckets[key] == nil {
+				buckets[key] = newMetrics()
+			}
+			buckets[key].recordCycle(res)
+		}
+	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to read results: %v\n", err)
 		return 1
@@ -221,6 +259,7 @@ func runReport(args []string) int {
 
 	fmt.Printf("--- Report: %d cycles from %d file(s) ---\n", n, fs.NArg())
 	m.printSummary(os.Stdout, "Elapsed (first -> last cycle start)", last.Sub(first))
+	printBuckets(os.Stdout, buckets, *bucket)
 	return 0
 }
 
@@ -252,6 +291,7 @@ func parseFlags() (Config, error) {
 	flag.BoolVar(&cfg.IgnoreAttachLimit, "ignore-attach-limit", false, "With --spread=balanced, do not cap volumes per node at the CSINode attach limit (the scheduler still enforces it: extra pods stay Pending)")
 	flag.BoolVar(&cfg.HoldUntilEnd, "hold-until-end", false, "Keep every pod and its volumes until the test stops instead of cycling (ignores --min-hold/--max-hold); use to fill nodes")
 	flag.DurationVar(&cfg.Ramp, "ramp", 0, "Start workers evenly spread over this duration instead of all at once (e.g. 10m)")
+	flag.DurationVar(&cfg.AuditInterval, "audit-interval", 10*time.Minute, "Interval between leak audits of VolumeAttachments and PVs (0 disables)")
 	flag.DurationVar(&cfg.StartupTimeout, "startup-timeout", 3*time.Minute, "Maximum time for PVCs to bind and the pod to reach Running")
 	flag.DurationVar(&cfg.TeardownTimeout, "teardown-timeout", 5*time.Minute, "Maximum time for pod, PVCs and PVs of a cycle to be deleted")
 	flag.DurationVar(&cfg.ReportInterval, "report-interval", 30*time.Second, "Interval between progress reports")
@@ -276,8 +316,8 @@ func parseFlags() (Config, error) {
 	if cfg.StartupTimeout <= 0 || cfg.TeardownTimeout <= 0 || cfg.ReportInterval <= 0 {
 		return cfg, fmt.Errorf("--startup-timeout, --teardown-timeout and --report-interval must be > 0")
 	}
-	if cfg.Ramp < 0 {
-		return cfg, fmt.Errorf("--ramp must be >= 0")
+	if cfg.Ramp < 0 || cfg.AuditInterval < 0 {
+		return cfg, fmt.Errorf("--ramp and --audit-interval must be >= 0")
 	}
 	if cfg.volumeQuantity, err = resource.ParseQuantity(cfg.VolumeCapacity); err != nil {
 		return cfg, fmt.Errorf("--volume-size %q: %w", cfg.VolumeCapacity, err)

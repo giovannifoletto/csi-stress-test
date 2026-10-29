@@ -42,7 +42,7 @@ func TestLoadResults(t *testing.T) {
 		`{"id":"truncated","namespace":`)
 
 	m := newMetrics()
-	first, last, n, err := loadResults(m, []string{a, b})
+	first, last, n, err := loadResults([]string{a, b}, m.recordCycle)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,7 +62,7 @@ func TestLoadResults(t *testing.T) {
 		t.Errorf("span: got %v want 5m", got)
 	}
 
-	if _, _, _, err := loadResults(newMetrics(), []string{filepath.Join(dir, "missing.jsonl")}); err == nil {
+	if _, _, _, err := loadResults([]string{filepath.Join(dir, "missing.jsonl")}, newMetrics().recordCycle); err == nil {
 		t.Error("expected error for missing file")
 	}
 }
@@ -125,7 +125,7 @@ func TestBalancerCapacity(t *testing.T) {
 	}
 }
 
-func TestOccupancy(t *testing.T) {
+func TestOccupancyAndBuckets(t *testing.T) {
 	m := newMetrics()
 	start := time.Date(2026, 10, 29, 10, 0, 0, 0, time.UTC)
 	for i := 0; i < 25; i++ {
@@ -141,5 +141,28 @@ func TestOccupancy(t *testing.T) {
 	// maxOcc 24 -> width 3 -> ranges 0-2 ... 24-26
 	if !strings.Contains(out.String(), "0-2  ") || !strings.Contains(out.String(), "24-26") {
 		t.Errorf("unexpected occupancy table:\n%s", out.String())
+	}
+
+	buckets := map[time.Time]*metrics{}
+	for _, h := range []int{0, 2} { // hour 1 is empty and must still be printed
+		bm := newMetrics()
+		bm.recordCycle(&cycleResult{Status: statusSuccess, LatenciesMs: map[string][]float64{"attach_mount": {2000}}})
+		buckets[start.Add(time.Duration(h)*time.Hour)] = bm
+	}
+	out.Reset()
+	printBuckets(&out, buckets, time.Hour)
+	if got := strings.Count(out.String(), "2026-10-29T"); got != 3 {
+		t.Errorf("expected 3 window rows, got %d:\n%s", got, out.String())
+	}
+}
+
+func TestAuditFormat(t *testing.T) {
+	a := &auditor{baseline: auditCounts{orphanVA: 1}}
+	line, grew := a.format(auditCounts{orphanVA: 1, pvReleased: 2})
+	if !grew || !strings.Contains(line, "orphan_va=1 ") || !strings.Contains(line, "pv_released=2(+2)") {
+		t.Errorf("unexpected audit line %q grew=%v", line, grew)
+	}
+	if _, grew := a.format(auditCounts{orphanVA: 1}); grew {
+		t.Error("counts equal to the baseline must not be reported as growth")
 	}
 }
